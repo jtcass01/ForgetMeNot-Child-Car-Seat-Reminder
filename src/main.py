@@ -830,28 +830,84 @@ class Subsystem(object):
         self.buzzer_pin = pyb.Pin(buzzer_pin_name, pyb.Pin.OUT_PP)
         self.vibration_motor_pin = pyb.Pin(vibration_motor_pin_name, pyb.Pin.OUT_PP)
         self.stop_flag = 0
-
-    def run(self):
-        percent_power_remaining = self.power_estimator.get_power_estimate()
+        self.armed = 0
 
         if self.subsystem_type == 'key_fob':
-            _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
-            _thread.start_new_thread( telemetry_listen_thread, ("Telemetry Listen Thread", self, 0.1) )
+            # Set up alarm off button
+            pyb.Switch().callback(lambda: self.disarm_alarm())
         elif self.subsystem_type == 'car_seat':
-            _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
-            _thread.start_new_thread( transmit_location_thread, ("Transmit Location Thread", self, 0.05) )
+            # TODO UPDATE!!
+            # Set up alarm off button
+            pyb.Switch().callback(lambda: self.disarm_alarm())
 
-        while percent_power_remaining > 15:
-            print(self.subsystem_type, " is running.")
-
-            percent_power_remaining = self.power_estimator.get_power_estimate()
-            time.sleep(1)
-
-        self.stop_flag = 1
+    def run(self):
+        distance_threshold = 10 # 10 meters
+        max_communication_wait_time = 15 # max communication wait time is 15 seconds
+        percent_power_remaining = self.power_estimator.get_power_estimate()
 
         while True:
-            # toggle low power LED
-            pass
+            # IF there is enough power, run gps and telemetry threads
+            if percent_power_remaining > 15:
+                if self.subsystem_type == 'key_fob':
+                    _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
+                    _thread.start_new_thread( telemetry_listen_thread, ("Telemetry Listen Thread", self, 0.1) )
+                elif self.subsystem_type == 'car_seat':
+                    _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
+                    _thread.start_new_thread( transmit_location_thread, ("Transmit Location Thread", self, 0.2) )
+
+            if self.subsystem_type == "key_fob":
+                # While there is enough power
+                while percent_power_remaining > 15:
+                    print(self.subsystem_type, " is running.  Current location", self.gps_module.get_location())
+
+                    # If there has been a message recent enough
+                    if self.telemetry_module.time_since_last_message < max_communication_wait_time:
+                        # Calculate the distance between subsystems
+                        distance_between_subsystems = self.calculate_distance_between_subsystems()
+
+                        # If alarm is armed
+                        if self.armed:
+                            # If distance is greater than threshold
+                            if distance_between_subsystems > distance_threshold:
+                                # Sound alarm
+                                self.sound_alarm()
+                            else:
+                                # Ensure alarm is quiet
+                                self.quiet_alarm()
+                        else:
+                            # If distance is less than threshold, make sure alarm is armed.
+                            if distance_between_subsystems < distance_threshold:
+                                self.armed = 1
+                    # IF it has been too long since a message
+                    else:
+                        # And alarm is armed. Sound alarm.
+                        if self.armed:
+                            self.sound_alarm()
+                        # Else alarm is not armed, ensure it is quiet.
+                        else:
+                            self.quiet_alarm()
+
+                    # Get updated power estimate.
+                    percent_power_remaining = self.power_estimator.get_power_estimate()
+
+                    time.sleep(1)
+            elif self.subsystem_type == 'car_seat':
+                # While there is enough power
+                while percent_power_remaining > 15:
+                    # Get updated power estimate.
+                    percent_power_remaining = self.power_estimator.get_power_estimate()
+
+                    time.sleep(5)
+
+            pyb.LED(1).on()
+            self.stop_flag = 1
+
+            while percent_power_remaining <= 15:
+                print("Power is low running on reserves")
+                percent_power_remaining = self.power_estimator.get_power_estimate()
+                pyb.LED(1).toggle()
+                time.sleep(1)
+            pyb.LED(1).off()
 
     def sound_alarm(self):
         self.buzzer_pin.high()
@@ -861,6 +917,10 @@ class Subsystem(object):
         self.buzzer_pin.low()
         self.vibration_motor_pin.low()
 
+    def disarm_alarm(self):
+        self.armed = 0
+        self.quiet_alarm()
+
     def calculate_distance_between_subsystems(self):
         my_latitude, my_longitude = self.gps_module.get_location()
         other_latitude, other_longitude = Subsystem.TelemetryModule.decode_message(self.telemetry_module.last_message)
@@ -868,7 +928,7 @@ class Subsystem(object):
         a = sin( radians(other_latitude - my_latitude) / 2 )**2 + cos(radians(my_latitude)) * cos(radians(other_latitude)) + sin( radians(other_longitude - my_longitude) / 2)**2
         c = 2 * atan2( sqrt(a), sqrt(1-a) )
         # the earth's radius is 6,371 km
-        return 6371 * c
+        return 6371000 * c
 
     class PowerEstimator(object):
         def __init__(self, adc_pin_name, gpio_pin_name):
@@ -877,16 +937,22 @@ class Subsystem(object):
             self.starting_counts = None
             self.percent_power_remaining = None
 
-        def get_power_estimate():
+        def get_power_estimate(self):
             self.gpio_pin.high()
 
-            if self.starting_counts is None:
-                self.starting_counts = self.adc_pin.read()
-                self.percent_power_remaining = 100.0
-            else:
-                self.percent_power_remaining = self.starting_counts / self.adc_pin.read() * 100
+            adc_counts = self.adc_pin.read()
 
             self.gpio_pin.low()
+
+            if self.starting_counts is None:
+                if adc_counts == 0:
+                    self.starting_counts = 1
+                else:
+                    self.starting_counts = adc_counts
+                self.percent_power_remaining = 100.0
+            else:
+                self.percent_power_remaining = adc_counts / self.starting_counts * 100
+
 
             return self.percent_power_remaining
 
@@ -894,7 +960,7 @@ class Subsystem(object):
         def __init__(self, uart_number):
             self.uart = pyb.UART(uart_number, 9600)
             self.last_message = None
-            self.time_since_last_message = 0
+            self.time_since_last_message = 15
 
         def send_message(self, message):
             self.uart.write(message)
@@ -913,8 +979,9 @@ class Subsystem(object):
             self.gps = MicropyGPS()
 
         def get_location(self):
-            return (convert_coordinate_to_decimal(self.gps.latitude), convert_coordinate_to_decimal(self.gps.longitude))
+            return (Subsystem.GPS_Module.convert_coordinate_to_decimal(self.gps.latitude), Subsystem.GPS_Module.convert_coordinate_to_decimal(self.gps.longitude))
 
+        @staticmethod
         def convert_coordinate_to_decimal(coordinate_list):
             degrees = float(coordinate_list[0])
             minutes = float(coordinate_list[1])
@@ -941,13 +1008,16 @@ def update_gps_thread(threadName, subsystem, delay):
 
 def transmit_location_thread(threadName, subsystem, delay):
     print("Starting thread ", threadName)
+    time_since_rearm = 0
+    time_to_rearm = 10
 
     while not subsystem.stop_flag:
-        subsystem.telemetry_module.send_message(str(subsystem.gps_module.get_location()) + "\n")
+        # TODO!!
+        subsystem.telemetry_module.send_message(str(self.armed) + "|" str(subsystem.gps_module.get_location()) + "\n")
         time.sleep(delay)
+        time_since_rearm += delay
 
 
 #car_seat_subsystem = Subsystem(subsystem_type='car_seat', power_estimator_adc_pin_name='X1', power_estimator_adc_gpio_pin_name='X3', telemetry_module_uart_pin_number=1, gps_module_uart_number=3, vibration_motor_pin_name='X5', buzzer_pin_name='X2')
 key_fob_subsystem = Subsystem(subsystem_type='key_fob', power_estimator_adc_pin_name='X2', power_estimator_adc_gpio_pin_name='X1', telemetry_module_uart_pin_number=3, gps_module_uart_number=1, vibration_motor_pin_name='Y8', buzzer_pin_name='X4')
-
 key_fob_subsystem.run()
