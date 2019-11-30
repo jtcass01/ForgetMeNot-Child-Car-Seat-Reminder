@@ -7,12 +7,13 @@ Taken from https://github.com/inmcm/micropyGPS/blob/master/micropyGPS.py
 
 """
 
-from math import floor, modf
+from math import floor, modf, sin, cos, atan2, pi, sqrt, radians
 
 # Assume running on MicroPython
 import utime
 
 import time
+import _thread
 
 class MicropyGPS(object):
     """GPS NMEA Sentence Parser. Creates object that stores all relevant GPS data and statistics.
@@ -828,10 +829,29 @@ class Subsystem(object):
         self.gps_module = Subsystem.GPS_Module(uart_number=gps_module_uart_number)
         self.buzzer_pin = pyb.Pin(buzzer_pin_name, pyb.Pin.OUT_PP)
         self.vibration_motor_pin = pyb.Pin(vibration_motor_pin_name, pyb.Pin.OUT_PP)
+        self.stop_flag = 0
 
     def run(self):
-        while True:
+        percent_power_remaining = self.power_estimator.get_power_estimate()
+
+        if self.subsystem_type == 'key_fob':
+            _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
+            _thread.start_new_thread( telemetry_listen_thread, ("Telemetry Listen Thread", self, 0.1) )
+        elif self.subsystem_type == 'car_seat':
+            _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
+            _thread.start_new_thread( transmit_location_thread, ("Transmit Location Thread", self, 0.05) )
+
+        while percent_power_remaining > 15:
             print(self.subsystem_type, " is running.")
+
+            percent_power_remaining = self.power_estimator.get_power_estimate()
+            time.sleep(1)
+
+        self.stop_flag = 1
+
+        while True:
+            # toggle low power LED
+            pass
 
     def sound_alarm(self):
         self.buzzer_pin.high()
@@ -840,6 +860,15 @@ class Subsystem(object):
     def quiet_alarm(self):
         self.buzzer_pin.low()
         self.vibration_motor_pin.low()
+
+    def calculate_distance_between_subsystems(self):
+        my_latitude, my_longitude = self.gps_module.get_location()
+        other_latitude, other_longitude = Subsystem.TelemetryModule.decode_message(self.telemetry_module.last_message)
+
+        a = sin( radians(other_latitude - my_latitude) / 2 )**2 + cos(radians(my_latitude)) * cos(radians(other_latitude)) + sin( radians(other_longitude - my_longitude) / 2)**2
+        c = 2 * atan2( sqrt(a), sqrt(1-a) )
+        # the earth's radius is 6,371 km
+        return 6371 * c
 
     class PowerEstimator(object):
         def __init__(self, adc_pin_name, gpio_pin_name):
@@ -855,17 +884,28 @@ class Subsystem(object):
                 self.starting_counts = self.adc_pin.read()
                 self.percent_power_remaining = 100.0
             else:
-                self.percent_power_remaining = self.starting_counts / self.adc_pin.read()
-
+                self.percent_power_remaining = self.starting_counts / self.adc_pin.read() * 100
 
             self.gpio_pin.low()
+
+            return self.percent_power_remaining
 
     class TelemetryModule(object):
         def __init__(self, uart_number):
             self.uart = pyb.UART(uart_number, 9600)
+            self.last_message = None
+            self.time_since_last_message = 0
 
         def send_message(self, message):
             self.uart.write(message)
+
+        @staticmethod
+        def decode_message(message):
+            message = message.split(",")
+            latitude = message[0][1:]
+            longitude = message[1][:-1]
+
+            return (float(latitude), float(longitude))
 
     class GPS_Module(object):
         def __init__(self, uart_number):
@@ -873,16 +913,41 @@ class Subsystem(object):
             self.gps = MicropyGPS()
 
         def get_location(self):
-            return (self.gps.latitude(), self.gps.longitude())
+            return (convert_coordinate_to_decimal(self.gps.latitude), convert_coordinate_to_decimal(self.gps.longitude))
 
-        def update_gps_thread(self):
-            while True:
-                if self.uart.any():
-                    self.gps.update(chr(self.uart.readchar()))
+        def convert_coordinate_to_decimal(coordinate_list):
+            degrees = float(coordinate_list[0])
+            minutes = float(coordinate_list[1])
+            return degrees + minutes / 60
+
+def telemetry_listen_thread(threadName, subsystem, delay):
+    print("Starting thread ", threadName)
+
+    while not subsystem.stop_flag:
+        if subsystem.telemetry_module.uart.any():
+            subsystem.telemetry_module.last_message = subsystem.telemetry_module.uart.read_line()
+        else:
+            time.sleep(delay)
+            subsystem.telemetry_module.time_since_last_message += delay
+
+def update_gps_thread(threadName, subsystem, delay):
+    print("Starting thread ", threadName)
+
+    while not subsystem.stop_flag:
+        if subsystem.gps_module.uart.any():
+            subsystem.gps_module.gps.update(chr(subsystem.gps_module.uart.readchar()))
+        else:
+            time.sleep(delay)
+
+def transmit_location_thread(threadName, subsystem, delay):
+    print("Starting thread ", threadName)
+
+    while not subsystem.stop_flag:
+        subsystem.telemetry_module.send_message(str(subsystem.gps_module.get_location()) + "\n")
+        time.sleep(delay)
+
 
 #car_seat_subsystem = Subsystem(subsystem_type='car_seat', power_estimator_adc_pin_name='X1', power_estimator_adc_gpio_pin_name='X3', telemetry_module_uart_pin_number=1, gps_module_uart_number=3, vibration_motor_pin_name='X5', buzzer_pin_name='X2')
 key_fob_subsystem = Subsystem(subsystem_type='key_fob', power_estimator_adc_pin_name='X2', power_estimator_adc_gpio_pin_name='X1', telemetry_module_uart_pin_number=3, gps_module_uart_number=1, vibration_motor_pin_name='Y8', buzzer_pin_name='X4')
 
-key_fob_subsystem.sound_alarm()
-time.sleep(1)
-key_fob_subsystem.quiet_alarm()
+key_fob_subsystem.run()
