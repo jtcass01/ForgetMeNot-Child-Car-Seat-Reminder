@@ -829,17 +829,18 @@ class Subsystem(object):
         self.gps_module = Subsystem.GPS_Module(uart_number=gps_module_uart_number)
         self.buzzer_pin = pyb.Pin(buzzer_pin_name, pyb.Pin.OUT_PP)
         self.vibration_motor_pin = pyb.Pin(vibration_motor_pin_name, pyb.Pin.OUT_PP)
+        self.alarm_ringing = 0
         self.stop_flag = 0
-        self.armed = 0
         self.time_since_disarm = 0
 
         if self.subsystem_type == 'key_fob':
             # Set up alarm off button
             pyb.Switch().callback(lambda: self.disarm_alarm())
+            self.armed = 0
         elif self.subsystem_type == 'car_seat':
-            # TODO UPDATE!!
             # Set up alarm off button
             pyb.Switch().callback(lambda: self.disarm_alarm())
+            self.armed = 1
 
     def run(self):
         distance_threshold = 10 # 10 meters
@@ -847,22 +848,21 @@ class Subsystem(object):
         rearm_time = 900 # rearm in 15 minutes after disarming
         percent_power_remaining = self.power_estimator.get_power_estimate()
 
-        while True:
-            # IF there is enough power, run gps and telemetry threads
-            if percent_power_remaining > 15:
-                if self.subsystem_type == 'key_fob':
-                    _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
-                    _thread.start_new_thread( telemetry_listen_thread, ("Telemetry Listen Thread", self, 0.1) )
-                elif self.subsystem_type == 'car_seat':
-                    _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
-                    _thread.start_new_thread( transmit_location_thread, ("Transmit Location Thread", self, 0.2) )
+        if self.subsystem_type == 'key_fob':
+            _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
+            _thread.start_new_thread( telemetry_listen_thread, ("Telemetry Listen Thread", self, 0.1) )
+        elif self.subsystem_type == 'car_seat':
+            _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
+            _thread.start_new_thread( transmit_location_thread, ("Transmit Location Thread", self, 0.2) )
 
+        while True:
             if self.subsystem_type == "key_fob":
                 # While there is enough power
                 while percent_power_remaining > 15:
                     print(self.subsystem_type, " is running.  Current location", self.gps_module.get_location())
 
                     # If there has been a message recent enough
+                    print("System armed state:", self.armed)
                     if self.telemetry_module.time_since_last_message < max_communication_wait_time:
                         if self.telemetry_module.time_since_disarm < rearm_time:
                             self.armed = 0
@@ -915,8 +915,14 @@ class Subsystem(object):
             pyb.LED(1).off()
 
     def sound_alarm(self):
-        self.buzzer_pin.high()
-        self.vibration_motor_pin.high()
+        if self.alarm_ringing:
+            self.buzzer_pin.high()
+            self.vibration_motor_pin.high()
+            self.alarm_ringing = 0
+        else:
+            self.buzzer_pin.low()
+            self.vibration_motor_pin.low()
+            self.alarm_ringing = 1
 
     def quiet_alarm(self):
         self.buzzer_pin.low()
@@ -929,13 +935,17 @@ class Subsystem(object):
 
     def calculate_distance_between_subsystems(self):
         my_latitude, my_longitude = self.gps_module.get_location()
-        other_latitude = Subsystem.TelemetryModule.last_latitude
-        other_longitude = Subsystem.TelemetryModule.last_longitude
+        other_latitude = self.telemetry_module.last_latitude
+        other_longitude = self.telemetry_module.last_longitude
 
-        a = sin( radians(other_latitude - my_latitude) / 2 )**2 + cos(radians(my_latitude)) * cos(radians(other_latitude)) + sin( radians(other_longitude - my_longitude) / 2)**2
-        c = 2 * atan2( sqrt(a), sqrt(1-a) )
-        # the earth's radius is 6,371 km
-        return 6371000 * c
+        if my_latitude == 0 or my_longitude == 0 or other_latitude == 0 or other_longitude == 0:
+            return 0
+        else:
+            a = sin( radians(other_latitude - my_latitude) / 2 )**2 + cos(radians(my_latitude)) * cos(radians(other_latitude)) + sin( radians(other_longitude - my_longitude) / 2)**2
+            c = 2 * atan2( sqrt(a), sqrt(1-a) )
+
+            # the earth's radius is 6,371 km
+            return 6371000 * c
 
     class PowerEstimator(object):
         def __init__(self, adc_pin_name, gpio_pin_name):
@@ -960,15 +970,15 @@ class Subsystem(object):
             else:
                 self.percent_power_remaining = adc_counts / self.starting_counts * 100
 
-
-            return self.percent_power_remaining
+            return 100
+#            return self.percent_power_remaining
 
     class TelemetryModule(object):
         def __init__(self, uart_number):
             self.uart = pyb.UART(uart_number, 9600)
-            self.last_longitude = None
-            self.last_latitude = None
-            self.time_since_disarm = 0
+            self.last_longitude = 0
+            self.last_latitude = 0
+            self.time_since_disarm = 900
             self.time_since_last_message = 15
 
         def send_message(self, message):
@@ -977,9 +987,10 @@ class Subsystem(object):
         @staticmethod
         def decode_message(message):
             message = message.split(",")
+
             armed = int(message[0][1:])
             latitude = float(message[1])
-            longitude = float(message[3][:-2])
+            longitude = float(message[2][:-2])
 
             return armed, latitude, longitude
 
@@ -998,50 +1009,78 @@ class Subsystem(object):
             return degrees + minutes / 60
 
 def telemetry_listen_thread(threadName, subsystem, delay):
-    print("Starting thread ", threadName)
+    print("Starting thread %TL% ", threadName)
 
-    while not subsystem.stop_flag:
-        if subsystem.telemetry_module.uart.any():
-            armed_state, subsystem.telemetry_module.last_longitude, subsystem.telemetry_module.last_latitude = subsystem.TelemetryModule.decode_message(subsystem.telemetry_module.uart.read_line())
-            subsystem.telemetry_module.time_since_last_message = 0
+    while True:
+        while not subsystem.stop_flag:
+            if subsystem.telemetry_module.uart.any():
+                try:
+                    data_line = subsystem.telemetry_module.uart.readline().decode('ascii')
+                except UnicodeError:
+                    data_line = ""
+                if len(data_line) > 10:
+                    if data_line[0] == '(' and data_line[-2] == ')':
+                        try:
+                            armed_state, subsystem.telemetry_module.last_longitude, subsystem.telemetry_module.last_latitude = subsystem.TelemetryModule.decode_message(data_line)
+                            print("%TL% *Message decoded* |armed_state: " + str(armed_state) + " |longitude: " + str(subsystem.telemetry_module.last_longitude) + " |latitude: " + str(subsystem.telemetry_module.last_latitude) + " |")
+                            subsystem.telemetry_module.time_since_last_message = 0
 
-            if not armed_state:
-                subsystem.armed = 0
-                subsystem.telemetry_module.time_since_disarm = 0
+                            if not armed_state:
+                                subsystem.armed = 0
+                                subsystem.telemetry_module.time_since_disarm = 0
+                            else:
+                                subsystem.armed = 1
+                                subsystem.telemetry_module.time_since_disarm += delay
+                                time.sleep(delay)
+                        except ValueError:
+                            subsystem.telemetry_module.time_since_last_message += delay
+                            subsystem.telemetry_module.time_since_disarm += delay
+                            time.sleep(delay)
             else:
+                subsystem.telemetry_module.time_since_last_message += delay
                 subsystem.telemetry_module.time_since_disarm += delay
                 time.sleep(delay)
-        else:
-            subsystem.telemetry_module.time_since_last_message += delay
-            time.sleep(delay)
+            print("%TL% Time since last message: ", subsystem.telemetry_module.time_since_last_message)
+            print("%TL% Time since last disarm transmission: ", subsystem.telemetry_module.time_since_disarm)
+            if subsystem.telemetry_module.time_since_last_message > 1900:
+                subsystem.telemetry_module.time_since_last_message /= 2
+            if subsystem.telemetry_module.time_since_disarm > 1900:
+                subsystem.telemetry_module.time_since_disarm /= 2
+        time.sleep(delay)
 
 def update_gps_thread(threadName, subsystem, delay):
-    print("Starting thread ", threadName)
+    print("%G% Starting thread ", threadName)
 
-    while not subsystem.stop_flag:
-        if subsystem.gps_module.uart.any():
-            subsystem.gps_module.gps.update(chr(subsystem.gps_module.uart.readchar()))
-        else:
-            time.sleep(delay)
+    while True:
+        while not subsystem.stop_flag:
+            if subsystem.gps_module.uart.any():
+                subsystem.gps_module.gps.update(chr(subsystem.gps_module.uart.readchar()))
+            else:
+                time.sleep(delay)
+        time.sleep(delay)
 
 def transmit_location_thread(threadName, subsystem, delay):
-    print("Starting thread ", threadName)
-    time_to_rearm = 180  # 3 minutes
+    print("%TT% Starting thread ", threadName)
+    time_to_rearm = 900  # 15 minutes
 
-    while not subsystem.stop_flag:
-        subsystem_latitude, subsystem_longitude = subsystem.gps_module.get_location()
+    while True:
+        while not subsystem.stop_flag:
+            subsystem_latitude, subsystem_longitude = subsystem.gps_module.get_location()
 
-        if subsystem.time_since_disarm < time_to_rearm:
+            if subsystem.time_since_disarm >= time_to_rearm:
+                subsystem.armed = 1
+
             subsystem.time_since_disarm += delay
-        else:
-            subsystem.armed = 1
-            subsystem.time_since_disarm += delay
+            message = "(" + str(subsystem.armed) + "," + str(subsystem_latitude) + "," + str(subsystem_longitude) + ")\n"
+            subsystem.telemetry_module.send_message(message)
+            print("%TT% message sent (excluding \\n)", message[:-1])
+            print("%TT% time since disarm ", subsystem.time_since_disarm)
 
-        subsystem.telemetry_module.send_message("(" + str(subsystem.armed) + "," str(subsystem_latitude) + "," + str(subsystem_longitude) + ")\n")
-
+            time.sleep(delay)
         time.sleep(delay)
 
 
 #car_seat_subsystem = Subsystem(subsystem_type='car_seat', power_estimator_adc_pin_name='X1', power_estimator_adc_gpio_pin_name='X3', telemetry_module_uart_pin_number=1, gps_module_uart_number=3, vibration_motor_pin_name='X5', buzzer_pin_name='X2')
 key_fob_subsystem = Subsystem(subsystem_type='key_fob', power_estimator_adc_pin_name='X2', power_estimator_adc_gpio_pin_name='X1', telemetry_module_uart_pin_number=3, gps_module_uart_number=1, vibration_motor_pin_name='Y8', buzzer_pin_name='X4')
+#pseudo_car_seat_system = Subsystem(subsystem_type='car_seat', power_estimator_adc_pin_name='X2', power_estimator_adc_gpio_pin_name='X1', telemetry_module_uart_pin_number=3, gps_module_uart_number=1, vibration_motor_pin_name='Y8', buzzer_pin_name='X4')
 key_fob_subsystem.run()
