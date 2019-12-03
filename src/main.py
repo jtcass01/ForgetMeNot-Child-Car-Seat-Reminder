@@ -7,7 +7,7 @@ Taken from https://github.com/inmcm/micropyGPS/blob/master/micropyGPS.py
 
 """
 
-from math import floor, modf, sin, cos, atan2, pi, sqrt, radians
+from math import floor, modf, sin, cos, asin, pi, sqrt, radians
 
 # Assume running on MicroPython
 import utime
@@ -831,7 +831,7 @@ class Subsystem(object):
         self.vibration_motor_pin = pyb.Pin(vibration_motor_pin_name, pyb.Pin.OUT_PP)
         self.alarm_ringing = 0
         self.stop_flag = 0
-        self.time_since_disarm = 0
+        self.time_since_disarm = 120
 
         if self.subsystem_type == 'key_fob':
             # Set up alarm off button
@@ -843,10 +843,11 @@ class Subsystem(object):
             self.armed = 1
 
     def run(self):
-        distance_threshold = 10 # 10 meters
+        distance_threshold = 20 # 20 meters
         max_communication_wait_time = 15 # max communication wait time is 15 seconds
-        rearm_time = 900 # rearm in 15 minutes after disarming
+        rearm_time = 120 # rearm in 2 minutes after disarming
         percent_power_remaining = self.power_estimator.get_power_estimate()
+        percent_power_remaining_threshold = 75
 
         if self.subsystem_type == 'key_fob':
             _thread.start_new_thread( update_gps_thread, ("Update GPS Location Thread", self, 0.1) )
@@ -858,32 +859,29 @@ class Subsystem(object):
         while True:
             if self.subsystem_type == "key_fob":
                 # While there is enough power
-                while percent_power_remaining > 15:
+                while percent_power_remaining > percent_power_remaining_threshold:
                     print(self.subsystem_type, " is running.  Current location", self.gps_module.get_location())
+                    print("percent_power_remaining", percent_power_remaining)
 
                     # If there has been a message recent enough
                     print("System armed state:", self.armed)
+                    print("Subsystem time since disarm", self.time_since_disarm)
+                    print("Telemetry module.last_armed", self.telemetry_module.last_armed)
                     if self.telemetry_module.time_since_last_message < max_communication_wait_time:
-                        if self.telemetry_module.time_since_disarm < rearm_time:
-                            self.armed = 0
-                        else:
-                            # Calculate the distance between subsystems
-                            distance_between_subsystems = self.calculate_distance_between_subsystems()
+                        # Calculate the distance between subsystems
+                        distance_between_subsystems = self.calculate_distance_between_subsystems()
+                        print("distance_between_subsystems", distance_between_subsystems)
 
-                            # If alarm is armed
-                            if self.armed:
-                                # If distance is greater than threshold
-                                if distance_between_subsystems > distance_threshold:
-                                    # Sound alarm
-                                    self.sound_alarm()
-                                else:
-                                    # Ensure alarm is quiet
-                                    self.quiet_alarm()
+                        # If alarm is armed
+                        if self.armed:
+                            # If distance is greater than threshold
+                            if distance_between_subsystems > distance_threshold:
+                                # Sound alarm
+                                self.sound_alarm()
                             else:
-                                # If distance is less than threshold, make sure alarm is armed.
-                                if distance_between_subsystems < distance_threshold:
-                                    self.armed = 1
-                    # IF it has been too long since a message
+                                # Ensure alarm is quiet
+                                self.quiet_alarm()
+                    # If it has been too long since a message
                     else:
                         # And alarm is armed. Sound alarm.
                         if self.armed:
@@ -892,13 +890,20 @@ class Subsystem(object):
                         else:
                             self.quiet_alarm()
 
+                    if self.telemetry_module.last_armed:
+                        if self.time_since_disarm < rearm_time:
+                            self.armed = 0
+                        else:
+                            self.armed = 1
+
                     # Get updated power estimate.
                     percent_power_remaining = self.power_estimator.get_power_estimate()
 
                     time.sleep(1)
+                    self.time_since_disarm += 1
             elif self.subsystem_type == 'car_seat':
                 # While there is enough power
-                while percent_power_remaining > 15:
+                while percent_power_remaining > percent_power_remaining_threshold:
                     # Get updated power estimate.
                     percent_power_remaining = self.power_estimator.get_power_estimate()
 
@@ -907,10 +912,17 @@ class Subsystem(object):
             pyb.LED(1).on()
             self.stop_flag = 1
 
-            while percent_power_remaining <= 15:
-                print("Power is low running on reserves")
+            buzz = 1
+            while percent_power_remaining <= percent_power_remaining_threshold:
+                print("Power is low running on reserves | percent_power_remaining =", percent_power_remaining, "|")
                 percent_power_remaining = self.power_estimator.get_power_estimate()
                 pyb.LED(1).toggle()
+                if buzz:
+                    self.buzzer_pin.high()
+                    buzz = 0
+                else:
+                    self.buzzer_pin.low()
+                    buzz = 1
                 time.sleep(1)
             pyb.LED(1).off()
 
@@ -941,11 +953,19 @@ class Subsystem(object):
         if my_latitude == 0 or my_longitude == 0 or other_latitude == 0 or other_longitude == 0:
             return 0
         else:
-            a = sin( radians(other_latitude - my_latitude) / 2 )**2 + cos(radians(my_latitude)) * cos(radians(other_latitude)) + sin( radians(other_longitude - my_longitude) / 2)**2
-            c = 2 * atan2( sqrt(a), sqrt(1-a) )
+            R = 6372.8  # Earth radius in kilometers
 
-            # the earth's radius is 6,371 km
-            return 6371000 * c
+            dLat = radians(other_latitude - my_latitude)
+            print("dLat", dLat)
+            dLon = radians(other_longitude - my_longitude)
+            print("dLon", dLon)
+            lat1 = radians(my_latitude)
+            lat2 = radians(other_latitude)
+
+            a = sin(dLat / 2)**2 + cos(lat1) * cos(lat2) * sin(dLon / 2)**2
+            c = 2 * asin(sqrt(a))
+
+            return R * c * 1000
 
     class PowerEstimator(object):
         def __init__(self, adc_pin_name, gpio_pin_name):
@@ -955,6 +975,9 @@ class Subsystem(object):
             self.percent_power_remaining = None
 
         def get_power_estimate(self):
+            """
+            # Function is shortcutted because we are having to use a 9V powersupply and the voltage divider is only designed for 6V.
+
             self.gpio_pin.high()
 
             adc_counts = self.adc_pin.read()
@@ -970,8 +993,10 @@ class Subsystem(object):
             else:
                 self.percent_power_remaining = adc_counts / self.starting_counts * 100
 
+            return self.percent_power_remaining
+            """
+
             return 100
-#            return self.percent_power_remaining
 
     class TelemetryModule(object):
         def __init__(self, uart_number):
@@ -980,6 +1005,7 @@ class Subsystem(object):
             self.last_latitude = 0
             self.time_since_disarm = 900
             self.time_since_last_message = 15
+            self.last_armed = 0
 
         def send_message(self, message):
             self.uart.write(message)
@@ -1021,7 +1047,8 @@ def telemetry_listen_thread(threadName, subsystem, delay):
                 if len(data_line) > 10:
                     if data_line[0] == '(' and data_line[-2] == ')':
                         try:
-                            armed_state, subsystem.telemetry_module.last_longitude, subsystem.telemetry_module.last_latitude = subsystem.TelemetryModule.decode_message(data_line)
+                            armed_state, subsystem.telemetry_module.last_latitude, subsystem.telemetry_module.last_longitude = subsystem.TelemetryModule.decode_message(data_line)
+                            subsystem.telemetry_module.last_armed = armed_state
                             print("%TL% *Message decoded* |armed_state: " + str(armed_state) + " |longitude: " + str(subsystem.telemetry_module.last_longitude) + " |latitude: " + str(subsystem.telemetry_module.last_latitude) + " |")
                             subsystem.telemetry_module.time_since_last_message = 0
 
@@ -1061,7 +1088,7 @@ def update_gps_thread(threadName, subsystem, delay):
 
 def transmit_location_thread(threadName, subsystem, delay):
     print("%TT% Starting thread ", threadName)
-    time_to_rearm = 900  # 15 minutes
+    time_to_rearm = 300  # 5 minutes
 
     while True:
         while not subsystem.stop_flag:
