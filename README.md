@@ -1,2 +1,8 @@
 # ForgetMeNot-Child-Car-Seat-Reminder
-Software related to the ForgetMeNot child car seat device that sounds an alarm when the user walks away from their car without getting their child.
+The design of this system was done with the help of Mason Gardone and Raley Suter for our Electrical & Computer Engineering undergraduate capstone project.
+
+## [System Requirements Specification]()
+
+## [System Design Specification]()
+
+## [Final Report]()
