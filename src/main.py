@@ -832,14 +832,12 @@ class Subsystem(object):
         self.alarm_ringing = 0
         self.stop_flag = 0
         self.time_since_disarm = 120
+        # Set up alarm off button
+        pyb.Switch().callback(lambda: self.disarm_alarm())
 
         if self.subsystem_type == 'key_fob':
-            # Set up alarm off button
-            pyb.Switch().callback(lambda: self.disarm_alarm())
             self.armed = 0
         elif self.subsystem_type == 'car_seat':
-            # Set up alarm off button
-            pyb.Switch().callback(lambda: self.disarm_alarm())
             self.armed = 1
 
     def run(self):
@@ -863,14 +861,9 @@ class Subsystem(object):
                     print(self.subsystem_type, " is running.  Current location", self.gps_module.get_location())
                     print("percent_power_remaining", percent_power_remaining)
 
-                    # If there has been a message recent enough
-                    print("System armed state:", self.armed)
-                    print("Subsystem time since disarm", self.time_since_disarm)
-                    print("Telemetry module.last_armed", self.telemetry_module.last_armed)
                     if self.telemetry_module.time_since_last_message < max_communication_wait_time:
                         # Calculate the distance between subsystems
                         distance_between_subsystems = self.calculate_distance_between_subsystems()
-                        print("distance_between_subsystems", distance_between_subsystems)
 
                         # If alarm is armed
                         if self.armed:
@@ -925,6 +918,7 @@ class Subsystem(object):
                     buzz = 1
                 time.sleep(1)
             pyb.LED(1).off()
+            self.stop_flag = 0
 
     def sound_alarm(self):
         if self.alarm_ringing:
@@ -975,9 +969,6 @@ class Subsystem(object):
             self.percent_power_remaining = None
 
         def get_power_estimate(self):
-            """
-            # Function is shortcutted because we are having to use a 9V powersupply and the voltage divider is only designed for 6V.
-
             self.gpio_pin.high()
 
             adc_counts = self.adc_pin.read()
@@ -994,16 +985,13 @@ class Subsystem(object):
                 self.percent_power_remaining = adc_counts / self.starting_counts * 100
 
             return self.percent_power_remaining
-            """
-
-            return 100
 
     class TelemetryModule(object):
         def __init__(self, uart_number):
             self.uart = pyb.UART(uart_number, 9600)
             self.last_longitude = 0
             self.last_latitude = 0
-            self.time_since_disarm = 900
+            self.time_since_disarm = 300
             self.time_since_last_message = 15
             self.last_armed = 0
 
